@@ -307,6 +307,7 @@ fn dump_all(shaders: &[Arc<Shader>]) {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
+    crate::descriptor::host::probe_view_limit();
     use victory_shader::{Container, FourCC, HwStage, RootType};
     let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
     let host = crate::shader_cache::host_shader(container, target)?;

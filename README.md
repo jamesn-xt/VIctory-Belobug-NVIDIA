@@ -1,3 +1,13 @@
+# Belobug NVIDIA - community development fork
+
+NVIDIA-focused experimental fork of [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD), maintained by Blitz Studios. This is a community adaptation, not an official Belobug release. Upstream history and credits are preserved below.
+
+Build with `Build-NVIDIA.ps1 -OutputDirectory <directory outside the checkout>`. Run `Launch-NVIDIA.ps1` from that directory with `-GameExe`, `-Config`, and `-DxcDirectory`. The launcher selects the Series S profile. Generate the separately supplied local BCPack sidecar with `Initialize-FormatTables.ps1`; it is not included in release assets.
+
+The experimental changes address physical NVIDIA descriptor bounds, source-aware shader caching, partially resident textures and mip allocation, texture retry fairness, typed integer lighting views, wave32 lowering retries, snapshot allocation and copy-back work. The upstream sky-following ambient fallback remains enabled. Stable 30 FPS and complete texture coverage are not established. See [NVIDIA development notes](docs/nvidia-development.md).
+
+---
+
 # VIctory fork for AMD Radeon (work in progress)
 
 This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak

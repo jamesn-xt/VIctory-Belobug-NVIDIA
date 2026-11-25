@@ -164,6 +164,7 @@ struct Bindless {
     placed_set: BTreeMap<u32, (u32, u32)>,
     /// Placed-texture slots changed since draws last prepared them.
     record_pending: BTreeSet<u32>,
+    record_cursor: u32,
     /// Persistent 256-byte-aligned bounce slices by `slot_index`.
     cbv_bounce: HashMap<u32, BounceSlot>,
     /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
@@ -513,6 +514,25 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// Discover the device's physical heap limit before the first shader is translated.
+pub(crate) fn probe_view_limit() {
+    static PROBE: std::sync::Once = std::sync::Once::new();
+    PROBE.call_once(|| {
+        let Some(host) = host() else { return };
+        // SAFETY: a temporary heap used only to query the device's accepted size.
+        let wide = unsafe { host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: victory_shader::emit::VIEW_SLOTS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        }) }.is_ok();
+        let count = if wide { victory_shader::emit::VIEW_SLOTS } else { PORTABLE_VIEWS };
+        victory_shader::emit::set_view_heap_limit(count - 1);
+        tracing::info!(count, "physical view heap limit set before shader translation");
+    });
+}
+
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released. A world
@@ -640,6 +660,7 @@ fn plan_note(part: usize, started: std::time::Instant, walked: usize, found: usi
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        probe_view_limit();
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -695,13 +716,13 @@ impl HostHeap {
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = wanted.min(PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS - 1),
+                    lost = wanted.saturating_sub(PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS - 1),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
+                    create(PORTABLE_VIEWS).ok()?,
+                    wanted.min(PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS - 1),
                     DYNAMIC_CAPPED,
                 )
             }
@@ -1523,9 +1544,11 @@ impl HostHeap {
             }
             let mut todo: Vec<(u32, Option<(u32, u32)>)> = Vec::new();
             if b.budget()[1] > 0 {
-                while todo.len() < SLOT_CHUNK
-                    && let Some(i) = b.record_pending.pop_first()
-                {
+                while todo.len() < SLOT_CHUNK {
+                    let next = b.record_pending.range(b.record_cursor..).next()
+                        .or_else(|| b.record_pending.first()).copied();
+                    let Some(i) = next else { break };
+                    b.record_pending.remove(&i);
                     todo.push((i, b.placed_set.get(&i).copied()));
                 }
             }
@@ -1577,13 +1600,16 @@ impl HostHeap {
                 over.push(index);
                 break;
             }
+            self.bindless.lock().unwrap_or_else(|e| e.into_inner()).record_cursor = index.wrapping_add(1);
             match self.resolve_placed(index, vi, generation) {
                 Ok(Some(t)) => {
                     let key = u64::from(generation) << 32 | u64::from(vi);
                     learnt.push((index, (key, t as usize)));
                     reached.push(t);
                 }
-                Ok(None) => {}
+                // A descriptor can be valid before any of its pages arrive.
+                // Keep its generation in the bounded, rotating recovery queue.
+                Ok(None) => over.push(index),
                 Err(()) => stale.push(index),
             }
         }

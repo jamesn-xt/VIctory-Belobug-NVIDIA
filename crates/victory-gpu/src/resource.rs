@@ -1726,6 +1726,19 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     // The description's padding holds anything; the same texture was made
     // up to four times for it. It holds the largest mip here.
     let mut desc = *desc;
+    let mut largest = largest;
+    // SAFETY: the supplied resource description has the exact 56-byte layout.
+    let shape = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if shape.dimension == 3 && shape.depth_or_array_size == 1
+        && shape.flags & 7 == 0 && shape.mip_levels > 1
+        && let Some(layout) = texture_layout(&shape).filter(|l| l.planes.len() == 1)
+    {
+        let prefix = &layout.planes[0].layout;
+        if let Some(first) = (largest..u32::from(shape.mip_levels)).find(|&first| {
+            let bytes = prefix.reach(first);
+            crate::texture::resident_bytes(address as *const u8, bytes as usize) == bytes
+        }) { largest = first; }
+    }
     desc[1] = 0;
     desc[13] = largest;
     let desc = &desc;
@@ -1750,7 +1763,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     let end = address.saturating_add(size);
     // The title's pages for it may not be there yet (streaming): nothing to
     // show, and the console's whole address space would not fit in memory.
-    if !cfg!(test) && !crate::texture::committed(address as *const u8, size as usize) {
+    if !cfg!(test) && crate::texture::resident_bytes(address as *const u8, size as usize) == 0 {
         return None;
     }
     let mut out = std::ptr::null();

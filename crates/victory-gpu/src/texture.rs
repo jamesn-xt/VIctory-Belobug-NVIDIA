@@ -288,9 +288,11 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
+        let rewritten = self.rewritten.swap(false, Ordering::AcqRel)
+            || crate::resource::textures() == crate::resource::Textures::Always;
         if !self.not_watched.load(Ordering::Relaxed) {
             if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                if !rewritten && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                     return (0, false);
                 }
                 last.asked = now;
@@ -308,8 +310,6 @@ impl Staging {
         // while `title_memory_written` still flips `rewritten` immediately.
         let frame = crate::queue::presented() + 1;
         let mode = crate::resource::textures();
-        let rewritten = self.rewritten.swap(false, Ordering::AcqRel)
-            || mode == crate::resource::Textures::Always;
         if rewritten {
             last.still = 0;
         }
@@ -319,7 +319,7 @@ impl Staging {
         {
             return (0, false);
         }
-        if !committed(self.memory, size) {
+        if !committed(self.memory, size) && resident_bytes(self.memory, size) == 0 {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -545,6 +545,26 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
             *read = Vec::new();
         }
     });
+}
+
+/// Readable bytes across all mapped regions, including textures with absent end pages.
+pub(crate) fn resident_bytes(at: *const u8, len: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    let mut p = at as usize;
+    let end = p.saturating_add(len);
+    let mut bytes = 0u64;
+    while p < end {
+        // SAFETY: VirtualQuery writes this plain output structure; it does not read title memory.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if n == 0 || next <= p { break; }
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 {
+            bytes += (next - p) as u64;
+        }
+        p = next;
+    }
+    bytes
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1047,6 +1067,51 @@ mod tests {
     }
 
     #[test]
+    fn warp_sparse_texture_keeps_resident_pixels_and_recovers_new_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = Host::new_warp() else { return };
+        let (width, height) = (128, 128);
+        let (copy, tex) = make_rgba_texture(&host, width, height);
+        let layout = tex.planes[0].layout.clone();
+        let size = layout.size as usize;
+        assert_eq!(size, 65536);
+        // SAFETY: this test owns the reservation and commits each half before writing it.
+        let raw = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) }.cast::<u8>();
+        assert!(!raw.is_null());
+        unsafe {
+            assert_eq!(VirtualAlloc(raw.cast(), size / 2, MEM_COMMIT, PAGE_READWRITE), raw.cast());
+            raw.write_bytes(0x32, size / 2);
+        }
+        let staging = create_staging(&host, None, 0, std::ptr::null(), &copy.texture, layout, raw)
+            .expect("create sparse staging");
+        let run_once = || {
+            let list = host.new_list().expect("new list");
+            list.defer_texture(staging.clone(), copy.clone());
+            list.expect_texture_state(&copy, SHADER_RESOURCE);
+            list.close();
+            host.execute(&[&list]);
+        };
+        run_once();
+        let pixels = read_back_rgba(&host, &copy, width, height);
+        assert!(pixels[..size / 2].iter().all(|&v| v == 0x32));
+        assert!(pixels[size / 2..].iter().all(|&v| v == 0));
+        unsafe {
+            let next = raw.add(size / 2);
+            assert_eq!(VirtualAlloc(next.cast(), size / 2, MEM_COMMIT, PAGE_READWRITE), next.cast());
+            next.write_bytes(0x76, size / 2);
+        }
+        staging.rewritten.store(true, Ordering::Release);
+        run_once();
+        let pixels = read_back_rgba(&host, &copy, width, height);
+        assert!(pixels[..size / 2].iter().all(|&v| v == 0x32));
+        assert!(pixels[size / 2..].iter().all(|&v| v == 0x76));
+        unsafe { assert_ne!(VirtualFree(raw.cast(), 0, MEM_RELEASE), 0) };
+    }
+
+    #[test]
     fn host_written_texture_never_queues_cpu_upload() {
         let Some(host) = Host::new_warp() else {
             return;
@@ -1120,5 +1185,24 @@ mod read_tests {
         });
         // SAFETY: this reservation is no longer used.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    #[test]
+    fn interior_pages_are_resident_even_when_both_ends_are_absent() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: private pages reserved, committed, and released by this test.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.add(PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), base.add(PAGE).cast());
+            assert_eq!(super::resident_bytes(base, 3 * PAGE), PAGE as u64);
+            assert_eq!(super::resident_bytes(base.add(PAGE + 1), PAGE - 2), (PAGE - 2) as u64);
+            assert_eq!(super::resident_bytes(base, PAGE), 0);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }

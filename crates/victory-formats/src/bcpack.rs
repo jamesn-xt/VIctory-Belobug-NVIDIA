@@ -121,7 +121,16 @@ impl Reader<'_> {
 impl Tables {
     /// The tables VIctory ships with.
     pub fn builtin() -> Result<Tables, Error> {
-        Tables::parse(include_bytes!("bcpack-tables.bin"))
+        #[cfg(test)]
+        { Tables::parse(include_bytes!("bcpack-tables.bin")) }
+        #[cfg(not(test))]
+        {
+            let path = std::env::var_os("VICTORY_BCPACK_TABLES").map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_exe().ok().map(|p| p.with_file_name("bcpack-tables.bin")))
+                .ok_or(Error("cannot locate bcpack-tables.bin"))?;
+            let bytes = std::fs::read(path).map_err(|_| Error("missing bcpack-tables.bin beside the executable"))?;
+            Tables::parse(&bytes)
+        }
     }
 
     /// Reads the table file: 128 x 9 u16 model frequencies (per bucket, the

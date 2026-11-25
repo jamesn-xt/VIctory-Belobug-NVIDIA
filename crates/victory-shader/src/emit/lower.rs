@@ -20,6 +20,9 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+#[path = "typed_views.rs"]
+mod typed_views;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -170,20 +173,25 @@ enum Stop {
 
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false) {
+    lower_with_types(parts, &[])
+}
+
+pub(crate) fn lower_with_types(parts: &Parts, uint_srvs: &'static [(u8, u32, u32)]) -> Result<Lowered, ShaderError> {
+    match lower_program(parts, false, uint_srvs) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true, uint_srvs),
         result => result,
     }
 }
 
-fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
+fn lower_program(parts: &Parts, numeric_selects: bool, uint_srvs: &'static [(u8, u32, u32)]) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects).run() {
+        match Lower::new_with_types(parts, &bad, numeric_selects, uint_srvs).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -466,6 +474,7 @@ fn half_shift(width: u32) -> u32 {
 }
 
 struct Lower<'a> {
+    uint_srvs: &'static [(u8, u32, u32)],
     s: Shader,
     x: &'a Parts<'a>,
     /// SGPR spills to VGPR lanes and their reloads that nothing reads any
@@ -1089,7 +1098,12 @@ impl SubDword {
 }
 
 impl<'a> Lower<'a> {
+    #[cfg(test)]
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
+        Self::new_with_types(x, bad, numeric_selects, &[])
+    }
+    fn new_with_types(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool,
+        uint_srvs: &'static [(u8, u32, u32)]) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1314,6 +1328,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             numeric_selects,
+            uint_srvs,
             split,
             console_cf: x.console_cf,
             wants_console_flow,
@@ -6163,14 +6178,14 @@ impl<'a> Lower<'a> {
                         7 => 8,
                         _ => return Err("an image dimension"),
                     };
-                    ((kind | u, 0x409), Some(kind))
+                    ((kind | u, if !uav && self.scalar_uint_srv(&src, kind) { 0x105 } else { 0x409 }), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
                     let stride = used.map_or(0, |u| u.stride);
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
-                        (10 | u, 0x409)
+                        (10 | u, if !uav && self.scalar_uint_srv(&src, 10) { 0x105 } else { 0x409 })
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
                     {
                         (12 | u, stride)
@@ -10542,7 +10557,9 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let uint = !uav && !*d16 && *dmask == 1
+            && matches!(name, "image_load" | "image_gather4_lz") && self.scalar_uint_srv(src, kind);
+        let props = (kind | if uav { 0x1000 } else { 0 }, if uint { 0x105 } else { 0x409 });
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -11217,11 +11234,13 @@ impl<'a> Lower<'a> {
                         let reference = float(self, (usize::from(f.o), None))?;
                         args.push(reference);
                         "textureGatherCmp.f32"
+                    } else if uint {
+                        "textureGather.i32"
                     } else {
                         "textureGather.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    let ret = self.resource_return_type(uint);
+                    self.s.op(c, name, Attr::ReadOnly, ret, op, &args)
                 }
             }
         } else {
@@ -11241,11 +11260,12 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
+            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                "textureLoad.f32",
+                if uint { "textureLoad.i32" } else { "textureLoad.f32" },
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 66,
                 &args,
             )
@@ -11261,7 +11281,7 @@ impl<'a> Lower<'a> {
         let mut xs = Vec::new();
         for ch in channels {
             let x = self.s.m.extract(c, r, ch);
-            xs.push(if *d16 {
+            xs.push(if uint { x } else if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
                 let i32t = self.s.t.i32;
@@ -11803,6 +11823,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        let uint = name == "buffer_load_format_x" && !uav && self.scalar_uint_srv(src, 10);
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -11810,13 +11831,14 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            let h = self.handle(site, src, false, (10 | u, if uint { 0x105 } else { 0x409 }))?;
             let index = index.unwrap_or(self.s.m.i32(0));
+            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                "bufferLoad.f32",
+                if uint { "bufferLoad.i32" } else { "bufferLoad.f32" },
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 68,
                 &[h, index, iu],
             )
@@ -11890,7 +11912,7 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            let x = if uint { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -13025,6 +13047,40 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_uint_load_matches_only_the_named_root_field_and_dimension() {
+        let vs = 0x8386ec5b_47a3b2de_49309239_7987b35du128.to_be_bytes();
+        let views = super::super::tiled_lighting_uint_srvs(vs);
+        let compile = |slot, offset: u32, dim: u32, views| {
+            let words = [
+                0xBE84_0300, 0xBE85_0380,           // s[4:5] = first root table
+                0xF40C_0302, 0xFA00_0000 | offset,  // s_load_dwordx8 s[12:19]
+                0xF000_1100 | dim, 0x0003_0C00,     // image_load v12, v[0:1], s[12:19]
+                0xD834_0000, 0x0000_0C00,           // ds_write_b32 v0, v12
+                S_ENDPGM,
+            ];
+            let (mut layout, mut used) = texture_tables();
+            layout.truncate(1);
+            used.truncate(1);
+            layout[0].slot = slot;
+            used[0].slot = slot;
+            used[0].table_offset_dwords = offset / 4;
+            lower_io_with_types(&words, layout, used, false, None, views).unwrap().dxil
+        };
+        // Texture2D, root 1 + 48 dwords. Native immediate is in bytes.
+        let matched = compile(1, 192, 8, views);
+        assert_ne!(matched, compile(1, 192, 8, &[]));
+        for (slot, offset, dim) in [(2, 192, 8), (1, 196, 8), (1, 192, 16)] {
+            assert_eq!(compile(slot, offset, dim, views), compile(slot, offset, dim, &[]));
+        }
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut matched.clone()).unwrap();
+        }
+    }
+
     use super::super::container::SigElement;
     use super::{Lowered, Numeric, Parts, SubDword, buffer_format, half_shift, inline_f16, lower};
     use crate::native::{
@@ -13186,6 +13242,17 @@ mod tests {
         wave64: bool,
         rsrc2: Option<u32>,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_io_with_types(words, layout, used, wave64, rsrc2, &[])
+    }
+
+    fn lower_io_with_types(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        rsrc2: Option<u32>,
+        uint_srvs: &'static [(u8, u32, u32)],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -13204,7 +13271,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage)?;
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        lower(&Parts {
+        super::lower_with_types(&Parts {
             psv: None,
             native: &native,
             p: &p,
@@ -13218,7 +13285,7 @@ mod tests {
             target: super::super::Target::ANY,
             console_cf: false,
             per_lane_only: false,
-        })
+        }, uint_srvs)
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
@@ -15026,4 +15093,5 @@ mod select_tests {
             assert_eq!(wave_ops, uses_select);
         }
     }
+
 }

@@ -204,6 +204,30 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
+// The physical heap may be smaller on NVIDIA. Never emit an index beyond it.
+static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(VIEW_SLOTS - 1);
+pub fn set_view_heap_limit(last: u32) {
+    VIEW_LIMIT.store(last.min(VIEW_SLOTS - 1), std::sync::atomic::Ordering::Relaxed);
+}
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Source and settings that affect generated code, independently of launcher changes.
+pub fn translation_fingerprint() -> Vec<u8> {
+    let mut out = env!("VICTORY_SHADER_SOURCE_HASH").as_bytes().to_vec();
+    out.push(u8::from(cfg!(feature = "diagnostics")));
+    out.push(u8::from(cfg!(debug_assertions)));
+    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|s| !s.is_empty()) {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = std::env::var_os(name) { out.extend_from_slice(value.as_encoded_bytes()); }
+        out.push(0);
+    }
+    out
+}
+
+
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.
@@ -366,6 +390,17 @@ pub fn emit(
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
         return original;
     }
+    if native.stage == HwStage::Cs && native.wave64 && !target.runs(64) && target.runs(32) {
+        let early = ir::without_early_outs(p);
+        let combined = early.as_ref().and_then(|p| ir::without_skips(p, true));
+        for mut form in [early, ir::without_skips(p, true), combined].into_iter().flatten() {
+            crate::sgpr_spill::forward(&mut form);
+            let Ok(st) = structure::structure(&form) else { continue };
+            let Ok(io) = io::raise(&form, native) else { continue };
+            let Ok(res) = resource::track_with(&form, &native.layout, native.stage, res.addresses) else { continue };
+            if let Ok(shader) = emit_program(c, native, &form, &st, &io, &res, target) { return Ok(shader); }
+        }
+    }
     let edges = threading::constant_edges(p, st);
     if edges.is_empty() {
         return original;
@@ -377,6 +412,24 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track_with(&p, &native.layout, native.stage, res.addresses)?;
     emit_program(c, native, &p, &st, &io, &res, target)
+}
+
+/// The tiled-lighting VS and six eye-lighting PS variants read scalar UINT
+/// masks and indices. These stripped programs have no bitcode or reflected
+/// component types. Bind the observed views by full input digest and exact
+/// root-table field. Other fields in these very shaders hold float textures.
+fn tiled_lighting_uint_srvs(digest: [u8; 16]) -> &'static [(u8, u32, u32)] {
+    // DXIL resource kinds 2 = Texture2D, 4 = Texture3D, 10 = TypedBuffer.
+    const DIRECTIONAL_EYE: &[(u8, u32, u32)] =
+        &[(0, 32, 10), (0, 968, 2), (0, 1160, 2), (1, 72, 2), (1, 80, 4)];
+    match u128::from_be_bytes(digest) {
+        0x8386ec5b_47a3b2de_49309239_7987b35d => &[(1, 48, 2), (1, 56, 2)],
+        0x46545633_f601b707_19765403_267442c5 | 0xa3c6e3b5_a1226f1b_3b08afe2_ac7b6c3d
+        | 0x58795ccc_1d3237cf_683a8a7a_a88391fd => DIRECTIONAL_EYE,
+        0x56d5f614_619f530c_f1cf2b90_43b580e8 | 0xbd4ac3d8_98dc88e0_c0d0f252_2fbe6341
+        | 0x50d20881_47c267aa_c6ec8d21_9970b21b => &DIRECTIONAL_EYE[1..],
+        _ => &[],
+    }
 }
 
 fn emit_program(
@@ -482,14 +535,14 @@ fn emit_program(
         console_cf: false,
         per_lane_only: false,
     };
-    let l = match lower::lower(&parts) {
+    let l = match lower::lower_with_types(&parts, tiled_lighting_uint_srvs(c.digest)) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
             let console = structure::structure_console(p);
             let lowered = match &console {
                 Ok(console) => {
                     parts.st = console;
                     parts.console_cf = true;
-                    lower::lower(&parts)
+                    lower::lower_with_types(&parts, tiled_lighting_uint_srvs(c.digest))
                 }
                 Err(e) => Err(ShaderError::Unsupported {
                     offset: 0,
@@ -507,7 +560,7 @@ fn emit_program(
                     parts.st = st;
                     parts.console_cf = false;
                     parts.per_lane_only = true;
-                    lower::lower(&parts).map_err(|_| e)?
+                    lower::lower_with_types(&parts, tiled_lighting_uint_srvs(c.digest)).map_err(|_| e)?
                 }
             }
         }

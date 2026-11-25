@@ -110,24 +110,70 @@ impl UnchangedPages {
     }
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Reuse the allocation, never its contents. A raw-address dispatch can retire
+/// hundreds of 4 MiB windows at once. Limiting this pool to eight buffers
+/// discarded already committed pages even when most of the byte budget was free.
+#[derive(Default)]
+struct SnapshotPool {
+    by_capacity: BTreeMap<usize, Vec<Vec<u8>>>,
+    bytes: usize,
+    count: usize,
+}
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
+impl SnapshotPool {
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        // A tiny snapshot must not monopolize the one large backing needed by a
+        // later heap-wide write. Pick the smallest backing that fits instead.
+        let most = n.saturating_mul(4).max(1 << 20);
+        let (&capacity, bucket) = self.by_capacity.range_mut(n..=most).next()?;
+        let mut buffer = bucket.pop()?;
+        if bucket.is_empty() {
+            self.by_capacity.remove(&capacity);
+        }
+        self.count -= 1;
+        self.bytes -= capacity;
+        buffer.clear();
+        Some(buffer)
+    }
+
+    fn put(&mut self, buffer: Vec<u8>) {
+        const MAX_BYTES: usize = 512 << 20;
+        const MAX_COUNT: usize = 512;
+        let capacity = buffer.capacity();
+        if capacity == 0 || capacity > MAX_BYTES {
+            return;
+        }
+        // Prefer to retain the larger, more expensive allocations under pressure.
+        // Equal-sized windows can be discarded directly when the pool is full.
+        while self.count >= MAX_COUNT || self.bytes > MAX_BYTES - capacity {
+            let mut smallest = self.by_capacity.first_entry().expect("nonempty snapshot pool");
+            let size = *smallest.key();
+            if size >= capacity {
+                return;
+            }
+            smallest.get_mut().pop();
+            if smallest.get().is_empty() {
+                smallest.remove();
+            }
+            self.count -= 1;
+            self.bytes -= size;
+        }
+        self.by_capacity.entry(capacity).or_default().push(buffer);
+        self.bytes += capacity;
+        self.count += 1;
+    }
+}
+
+static POOL: std::sync::LazyLock<Mutex<SnapshotPool>> =
+    std::sync::LazyLock::new(|| Mutex::new(SnapshotPool::default()));
+
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+    reused.unwrap_or_else(|| Vec::with_capacity(n))
+}
+
+fn give_back(v: Vec<u8>) {
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).put(v);
 }
 
 /// Snapshot memory of one tile each, kept for reuse: a world frame takes
@@ -176,26 +222,7 @@ pub(crate) fn sparse_writes_text() -> String {
 
 /// Bytes of the snapshot memory kept for reuse.
 pub(crate) fn pool_bytes() -> u64 {
-    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.iter().map(|v| v.capacity() as u64).sum()
-}
-
-/// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
-/// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
-const POOL_BYTES: usize = 512 << 20;
-
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
-/// and no more than [`POOL_BYTES`] in all).
-fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).bytes as u64
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2176,85 +2203,106 @@ impl Shadow {
 /// `title`, and returns the tight `[first, last)` byte span where `title` was
 /// modified (or `None` if nothing changed). Scans 8 bytes at a time so
 /// unchanged 64-bit words skip per-byte branching.
-fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
-    let n = title.len().min(host.len()).min(old.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
-    let mut i = 0;
-    while i + 8 <= n {
-        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
-        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
-        if hw == ow {
-            host[i..i + 8].copy_from_slice(&title[i..i + 8]);
-        } else {
-            for k in i..i + 8 {
-                let h = host[k];
-                if h != old[k] && title[k] != h {
-                    title[k] = h;
-                    first = first.min(k);
-                    last = k + 1;
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    let mut runs = Vec::with_capacity(64);
+    // The first byte of a run not yet ended.
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        // Bit `k`: byte `base + k` differs.
+        let mut differ = 0u64;
+        for part in 0..4 {
+            let at = base + 16 * part;
+            // SAFETY: `at + 16 <= base + 64 <= n`, the length of both
+            // slices; the loads are unaligned ones. SSE2 is part of x86-64.
+            let equal = unsafe {
+                let a = _mm_loadu_si128(now.as_ptr().add(at).cast::<__m128i>());
+                let b = _mm_loadu_si128(was.as_ptr().add(at).cast::<__m128i>());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32 & 0xffff
+            };
+            differ |= u64::from(!equal & 0xffff) << (16 * part);
+        }
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, base - first));
+            }
+        } else if differ != u64::MAX || open.is_none() {
+            let mut at = 0u32;
+            while at < 64 {
+                match open {
+                    None => {
+                        // The next byte that differs, if any.
+                        let skip = (differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        open = Some(base + at as usize);
+                    }
+                    Some(first) => {
+                        // The next byte that is equal, if any.
+                        let skip = (!differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        runs.push((first, base + at as usize - first));
+                        open = None;
+                    }
                 }
-                host[k] = title[k];
             }
         }
-        i += 8;
+        base += 64;
     }
-    for k in i..n {
-        let h = host[k];
-        if h != old[k] && title[k] != h {
-            title[k] = h;
-            first = first.min(k);
-            last = k + 1;
+    for i in base..n {
+        match (open, now[i] != was[i]) {
+            (None, true) => open = Some(i),
+            (Some(first), false) => {
+                runs.push((first, i - first));
+                open = None;
+            }
+            _ => {}
         }
-        host[k] = title[k];
     }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new(); let mut i = 0;
+    while i < now.len().min(was.len()) {
+        if now[i] == was[i] { i += 1; continue; }
+        let start = i; i += 1;
+        while i < now.len().min(was.len()) && now[i] != was[i] { i += 1; }
+        runs.push((start, i - start));
+    }
+    runs
+}
+
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
+    let n = title.len().min(host.len()).min(old.len());
+    let mut first = usize::MAX; let mut last = 0;
+    for (at, len) in changed_runs_wide(&host[..n], &old[..n]) {
+        for k in at..at + len {
+            if title[k] != host[k] { title[k] = host[k]; first = first.min(k); last = k + 1; }
+        }
+    }
+    host[..n].copy_from_slice(&title[..n]);
     (first < last).then_some((first, last))
 }
 
-/// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
-fn merge_gpu_writes_mut(
-    title: &mut [u8],
-    host: &mut [u8],
-    old: &mut [u8],
-) -> Option<(usize, usize)> {
+fn merge_gpu_writes_mut(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> Option<(usize, usize)> {
+    let changed = merge_gpu_writes(title, host, old);
     let n = title.len().min(host.len()).min(old.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
-    let mut i = 0;
-    while i + 8 <= n {
-        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
-        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
-        if hw == ow {
-            let tw = &title[i..i + 8];
-            host[i..i + 8].copy_from_slice(tw);
-            old[i..i + 8].copy_from_slice(tw);
-        } else {
-            for k in i..i + 8 {
-                let h = host[k];
-                if h != old[k] && title[k] != h {
-                    title[k] = h;
-                    first = first.min(k);
-                    last = k + 1;
-                }
-                let t = title[k];
-                host[k] = t;
-                old[k] = t;
-            }
-        }
-        i += 8;
-    }
-    for k in i..n {
-        let h = host[k];
-        if h != old[k] && title[k] != h {
-            title[k] = h;
-            first = first.min(k);
-            last = k + 1;
-        }
-        let t = title[k];
-        host[k] = t;
-        old[k] = t;
-    }
-    (first < last).then_some((first, last))
+    old[..n].copy_from_slice(&title[..n]);
+    changed
 }
 
 /// Merges GPU-modified bytes (`gpu_new != staging_old`) into `title` and syncs
@@ -2707,5 +2755,46 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_pool_tests {
+    use super::SnapshotPool;
+
+    #[test]
+    fn a_batch_of_windows_reuses_each_backing_without_reusing_its_contents() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..64 {
+            pool.put(vec![0x6b; 4096]);
+        }
+        let medium = vec![0; 8192];
+        let medium_capacity = medium.capacity();
+        pool.put(medium);
+        let count = pool.count;
+        let mut active = Vec::new();
+        for _ in 0..64 {
+            let buffer = pool.take(4096).unwrap();
+            assert_eq!(buffer.capacity(), 4096);
+            assert!(buffer.is_empty());
+            active.push(buffer);
+        }
+        assert_eq!(pool.count, count - 64);
+        assert_eq!(pool.bytes, medium_capacity);
+        assert!(pool.take(8193).is_none());
+        assert_eq!(pool.take(4097).unwrap().capacity(), medium_capacity);
+        assert_eq!((pool.count, pool.bytes), (0, 0));
+    }
+
+    #[test]
+    fn a_full_pool_replaces_small_buffers_and_bounds_metadata_for_tiny_ones() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..1024 {
+            pool.put(Vec::with_capacity(8));
+        }
+        assert_eq!((pool.count, pool.bytes), (512, 4096));
+        pool.put(Vec::with_capacity(16));
+        assert_eq!((pool.count, pool.bytes), (512, 4104));
+        assert_eq!(pool.take(16).unwrap().capacity(), 16);
     }
 }

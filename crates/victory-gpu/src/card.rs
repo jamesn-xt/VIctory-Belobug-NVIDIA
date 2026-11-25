@@ -125,7 +125,9 @@ fn limits() -> (u64, u64) {
                 << 20
         };
         (
-            mb("VICTORY_CARD_BUFFERS_MIN_MB", 4).max(1 << 20),
+            std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok()
+                .and_then(|v| v.trim().parse::<u64>().ok()).filter(|&v| v > 0)
+                .map_or_else(|| mb("VICTORY_CARD_BUFFERS_MIN_MB", 4).max(1 << 20), |v| v.saturating_mul(1024).max(PAGE as u64)),
             mb("VICTORY_CARD_BUFFERS_MB", 2048),
         )
     })

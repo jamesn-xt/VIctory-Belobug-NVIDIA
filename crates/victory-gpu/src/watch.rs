@@ -1093,6 +1093,10 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        // Other fixtures keep historical writes after freeing their allocations.
+        // Windows can reuse that address: isolate this fresh allocation's journal.
+        JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written
+            .retain(|&page, _| page < start / PAGE || page >= end / PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
