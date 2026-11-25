@@ -25,6 +25,7 @@ Get-ChildItem Env:VICTORY_* | Remove-Item
 $env:VICTORY_CONFIG = $Config
 $env:VICTORY_DXIL = $dxil
 $env:VICTORY_PC_DXC = $dxc
+$env:VICTORY_FPS = '0'
 $env:VICTORY_LOG = 'victory_gpu=info,warn'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '64'
 $env:VICTORY_CARD_BUFFERS_MB = '1280'

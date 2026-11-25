@@ -69,9 +69,62 @@ pub(crate) fn rects(text: &str, at: (i32, i32), dot: i32) -> Vec<RECT> {
     all
 }
 
+/// Keep each clear small: a large rectangle list fast-fails in NVIDIA's
+/// driver while recording the first FPS readout on RTX 4080.
+pub(crate) unsafe fn clear_marks(
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    view: windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+    marks: &[RECT],
+) {
+    for batch in marks.chunks(16) {
+        // SAFETY: the caller supplies a live RTV in render-target state.
+        unsafe { list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(batch)) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_records_and_executes_large_fps_readouts() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1280, Height: 720, DepthOrArraySize: 1, MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut target: Option<ID3D12Resource> = None;
+        // SAFETY: private render target and RTV kept alive through GPU completion.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                None, &mut target,
+            ).expect("readout target");
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1,
+                    ..Default::default()
+                }).expect("readout RTV");
+            let view = heap.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateRenderTargetView(target.as_ref().unwrap(), None, view);
+            let list = host.new_list().expect("readout list");
+            for text in ["1.0 FPS  1070 MS", "30.0 FPS  33 MS", "120.0 FPS  8 MS"] {
+                let marks = rects(text, (12, 12), 4);
+                assert!(marks.len() > 16);
+                clear_marks(&list.list, view, &marks);
+            }
+            list.close();
+            host.execute(&[&list]);
+            host.device.GetDeviceRemovedReason().expect("readout device stays valid");
+        }
+    }
 
     #[test]
     fn a_row_of_dots_is_one_rectangle() {

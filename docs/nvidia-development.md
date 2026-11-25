@@ -22,4 +22,9 @@ Belobug and all VIctory contributors retain their existing credit and history. T
 
 Regression tests, compilation, offline shader validation, and the RTX 4080 scene result are recorded in release notes. A successful test suite does not establish complete game rendering. This branch remains experimental; reviewers should assess the individual commits before upstream integration.
 
-Local pre-launch checks on RTX 4080: GPU suite 119 passed / 4 ignored; shader suite 274 passed / 6 ignored / 4 failed. All four shader failures reproduce on the unmodified Belobug base (two wave64 pipeline refusals and two split-wave divergent scalar counts). They remain tracked limitations, not passing checks. The new sparse texture GPU readback regression is pending execution; game validation takes priority for this iteration.
+Local pre-launch checks on RTX 4080: GPU suite 122 passed / 4 ignored; shader suite 274 passed / 6 ignored / 4 failed. All four shader failures reproduce on the unmodified Belobug base (two wave64 pipeline refusals and two split-wave divergent scalar counts). They remain tracked limitations, not passing checks. The sparse-texture GPU readback, actual hardware FPS-overlay execution, and pipeline priority regressions pass. The first scene run was stopped after confirming a 500 ms pipeline-wait regression; active-use priority is the next runtime validation.
+
+
+### Startup follow-up
+
+The initial RTX launch fast-failed in `nvwgf2umx.dll` (0xc0000409, parameter 2). A local dump's call stack led to `Presenter::readout`. Disabling the FPS overlay survived the failing startup point; recording the glyph rectangles in batches of 16 now passes a real hardware GPU execution test. The launcher conservatively disables the overlay while retaining caption/log measurements. Menu frames spent 500 ms waiting for a shader behind background prewarming; first-use pipeline jobs now overtake warmups without duplicate compiles. These are separate fixes from texture residency.

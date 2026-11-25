@@ -125,7 +125,7 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
+        start(p, true);
         if p.lost.load(Ordering::Relaxed) {
             return None;
         }
@@ -141,10 +141,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 }
 
 /// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
+fn start(p: &Arc<Pending>, urgent: bool) {
     if !p.queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        queue(p.clone());
+        queue(p.clone(), urgent);
+    } else if urgent {
+        // A cached warm-up must yield to a pass the title is using now.
+        let q = &QUEUES[usize::from(p.screen)];
+        q.promote(p);
     }
 }
 
@@ -153,7 +157,7 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, false);
     }
 }
 
@@ -181,9 +185,25 @@ fn wait(p: &Pending, frame: u64) {
     waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// What the workers take from: the ordinary pipelines, the screen passes.
-static RECEIVER: [OnceLock<Mutex<std::sync::mpsc::Receiver<Arc<Pending>>>>; 2] =
-    [const { OnceLock::new() }; 2];
+/// Separate priority queues for ordinary pipelines and screen passes.
+struct WorkQueue {
+    items: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    changed: Condvar,
+}
+impl WorkQueue {
+    fn promote(&self, p: &Arc<Pending>) {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = items.iter().position(|item| Arc::ptr_eq(item, p)) {
+            let item = items.remove(at).expect("queued pipeline");
+            items.push_front(item);
+            self.changed.notify_one();
+        }
+    }
+}
+static QUEUES: [WorkQueue; 2] = [const { WorkQueue {
+    items: Mutex::new(std::collections::VecDeque::new()),
+    changed: Condvar::new(),
+} }; 2];
 
 /// What the workers (by thread) are making.
 static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
@@ -199,10 +219,15 @@ fn worker(i: usize, screen: bool) {
                 use windows::Win32::System::Threading::*;
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             }
-            let Some(receiver) = RECEIVER[usize::from(screen)].get() else { return };
+            let q = &QUEUES[usize::from(screen)];
             loop {
-                let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok(p) = next else { return };
+                let p = {
+                    let mut items = q.items.lock().unwrap_or_else(|e| e.into_inner());
+                    while items.is_empty() {
+                        items = q.changed.wait(items).unwrap_or_else(|e| e.into_inner());
+                    }
+                    items.pop_front().expect("nonempty pipeline queue")
+                };
                 // SAFETY: a plain call.
                 let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((id, p.clone()));
@@ -241,28 +266,21 @@ pub(super) fn worker_lost(id: u32) {
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8, and two
 /// for screen passes), started on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: [OnceLock<std::sync::mpsc::Sender<Arc<Pending>>>; 2] =
-        [const { OnceLock::new() }; 2];
+fn queue(p: Arc<Pending>, urgent: bool) {
+    static STARTED: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
     let screen = p.screen;
-    let sender = SENDER[usize::from(screen)].get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let _ = RECEIVER[usize::from(screen)].set(Mutex::new(receiver));
-        let workers = if screen {
-            2
-        } else {
+    let q = &QUEUES[usize::from(screen)];
+    {
+        let mut items = q.items.lock().unwrap_or_else(|e| e.into_inner());
+        if urgent { items.push_front(p); } else { items.push_back(p); }
+    }
+    STARTED[usize::from(screen)].call_once(|| {
+        let workers = if screen { 2 } else {
             std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
         };
-        for i in 0..workers {
-            worker(i + if screen { 50 } else { 0 }, screen);
-        }
-        sender
+        for i in 0..workers { worker(i + if screen { 50 } else { 0 }, screen); }
     });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
-    }
+    q.changed.notify_one();
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -286,6 +304,24 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_use_overtakes_warmups_without_duplicating_in_flight_work() {
+        let warm = Arc::new(Pending::new(Vec::new(), None));
+        let screen = Arc::new(Pending::new(Vec::new(), None));
+        let q = WorkQueue {
+            items: Mutex::new([warm.clone(), screen.clone()].into()),
+            changed: Condvar::new(),
+        };
+        q.promote(&screen);
+        q.promote(&screen);
+        assert!(Arc::ptr_eq(&q.items.lock().unwrap().pop_front().unwrap(), &screen));
+        // A worker now owns it: another use must not queue a second compile.
+        q.promote(&screen);
+        let mut items = q.items.lock().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(Arc::ptr_eq(&items.pop_front().unwrap(), &warm));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
