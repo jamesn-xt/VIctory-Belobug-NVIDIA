@@ -43,8 +43,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// A region is one guarded block (64 KiB) now, where it was 64 MiB: the
 /// title writes somewhere in every 64 MiB of its buffers between two checks
 /// of the same range, so nearly every first check of a range walked all its
-/// blocks under the guards' lock (14,000 walks and 12 GB of ranges a world
-/// frame, 96 % of them unchanged). `VICTORY_EPOCH_SHIFT=26` is the old size.
+/// blocks under the guards' lock (some 2,600 walks and 1.6 GB of ranges a
+/// world frame, 95 % of them unchanged). `VICTORY_EPOCH_SHIFT=26` is the old
+/// size.
 /// Regions are never smaller than a block: opening a block bumps the regions
 /// of the address written, which must be those of the whole block.
 const REGION_BUCKETS: usize = 1 << 20; // 64 GiB of 64 KiB regions before two share a bucket
