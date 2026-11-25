@@ -394,3 +394,167 @@ fn loops_with_an_exit_mask_grown_from_zero() {
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
 }
+
+/// [`program`] with 512 bytes of LDS.
+fn program_lds(body: &[u32], threads: u32) -> crate::NativeProgram {
+    let mut p = program(body, threads);
+    if let StageIo::Cs(io) = &mut p.io {
+        io.rsrc2 |= 1 << 15;
+    }
+    p
+}
+
+/// [`flow_case`] for a program with LDS ([`program_lds`]), checked on every
+/// hardware adapter: on a host without 64-lane waves it runs in the console
+/// flow, its halves meeting between LDS accesses.
+fn lds_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32) {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let p = program_lds(body, threads);
+        let split = !host.target().runs(64);
+        let groups = 2;
+        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        let expect: Vec<u32> = (0..groups).flat_map(|_| (0..threads).map(&want)).collect();
+        assert_eq!(
+            out, expect,
+            "{name}: {label}, {threads} threads (split {split})"
+        );
+        eprintln!("{name}: {label}, {threads} threads exact (split {split})");
+    }
+}
+
+/// Lane t stores t at LDS dword t (v1 = 4t).
+const LDS_OWN: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xD834_0000,
+    0x0000_0001, // ds_write_b32 v1, v0
+];
+
+/// v2 = LDS dword (n - t), n an inline constant code.
+const fn lds_read_mirror(n: u32) -> [u32; 5] {
+    [
+        0x4C08_0000 | n, // v_sub_nc_u32 v4, n, v0
+        0x3408_0882,     // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0200_0004, // ds_read_b32 v2, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]
+}
+
+/// One console wave per group shares LDS without a barrier, as the console
+/// compiler leaves it within one wave: lane t writes dword t, then reads
+/// dword 63 - t, which the other half wrote. Refused before on hosts
+/// without 64-lane waves.
+#[test]
+fn lds_shared_within_one_console_wave_reads_the_other_half() {
+    let mut body = LDS_OWN.to_vec();
+    body.extend(lds_read_mirror(0xBF)); // 63
+    lds_case("LDS[63 - t] after LDS[t] = t", &body, 64, |t| 63 - t);
+    // A partial upper half.
+    let mut body = LDS_OWN.to_vec();
+    body.extend(lds_read_mirror(0xAF)); // 47
+    lds_case("LDS[47 - t] after LDS[t] = t", &body, 48, |t| 47 - t);
+}
+
+/// A read, then a write of the dword the other half reads: in step, every
+/// lane reads before any lane writes.
+#[test]
+fn lds_reads_come_before_the_other_halfs_later_writes() {
+    let mut body = LDS_OWN.to_vec();
+    body.extend([
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0200_0004, // ds_read_b32 v2, v4
+        0x7E0A_02FF,
+        1000, // v_mov_b32 v5, 1000
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]);
+    lds_case("LDS[t ^ 32] read before LDS[t] = 1000", &body, 64, |t| {
+        t ^ 32
+    });
+}
+
+/// Lanes below 20 (all in the lower half) write into the upper half's
+/// dwords inside a branch; then every lane reads its own dword.
+#[test]
+fn lds_writes_inside_a_branch_reach_the_other_half() {
+    let mut body = LDS_OWN.to_vec();
+    body.extend([
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0006, // s_cbranch_execz +6
+        0x4A0A_00FF,
+        100,         // v_add_nc_u32 v5, 100, v0
+        0x4A0C_00A0, // v_add_nc_u32 v6, 32, v0
+        0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+        0xD834_0000,
+        0x0000_0506, // ds_write_b32 v6, v5
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xD8D8_0000,
+        0x0200_0001, // ds_read_b32 v2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]);
+    let want = |t: u32| {
+        if (32..52).contains(&t) {
+            100 + t - 32
+        } else {
+            t
+        }
+    };
+    lds_case("LDS[t + 32] = 100 + t for t < 20", &body, 64, want);
+    lds_case("LDS[t + 32] = 100 + t for t < 20", &body, 48, want);
+}
+
+/// Lanes of the other half read whole (`v_readlane`) and through LDS in one
+/// program: the console flow with LDS.
+#[test]
+fn lane_reads_and_lds_in_one_console_wave() {
+    let mut body = LDS_OWN.to_vec();
+    body.extend([
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+    ]);
+    body.extend(lds_read_mirror(0xBF)); // 63
+    body.push(0x4A04_0409); // v_add_nc_u32 v2, s9, v2
+    lds_case("readlane 40 + LDS[63 - t]", &body, 64, |t| 63 - t + 40);
+}
+
+/// Both kinds of program translate for a host without 64-lane waves now,
+/// in waves of 32, and keep the console's wave of 64 where the host runs it.
+#[test]
+fn one_console_wave_with_lds_translates_without_64_lane_waves() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let rdna = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    let mut plain = LDS_OWN.to_vec();
+    plain.extend(lds_read_mirror(0xBF));
+    let mut lanes = plain.clone();
+    lanes.extend([
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ]);
+    for body in [&plain, &lanes] {
+        let p = program_lds(body, 64);
+        let cs = emit_for(&p, nvidia).expect("translates without 64-lane waves");
+        assert_eq!(wave_size(&cs.dxil), Some(32));
+        let cs = emit_for(&p, rdna).expect("translates with 64-lane waves");
+        assert_eq!(wave_size(&cs.dxil), Some(64));
+    }
+    // Two console waves per group still cannot meet at a barrier.
+    assert!(emit_for(&program_lds(&lanes, 128), nvidia).is_err());
+}

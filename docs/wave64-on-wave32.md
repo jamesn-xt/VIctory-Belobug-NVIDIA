@@ -1,10 +1,12 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
-read only their own half run as two 32-lane waves. Groups of one console
-wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops. Still open: groups of several console
-waves, LDS, whole-wave sections and `ds_(b)permute`.
+Status: steps 1, 2, 4 and 5 are in, and the one-wave half of step 6. On
+NVIDIA, wave64 programs whose lanes read only their own half run as two
+32-lane waves. Groups of one console wave also run in the console flow:
+masks read whole, lanes of the other half, divergent branches and loops,
+scalars a divergent loop leaves, and LDS shared within the wave. Still
+open: groups of several console waves, whole-wave sections and
+`ds_(b)permute`.
 
 ## The problem
 
@@ -113,8 +115,39 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
+waves, at most 64 threads per group, no `ds_(b)permute`, and no
 whole-wave sections.
+
+### LDS within one console wave
+
+The console runs a wave's lanes in step, so an LDS write is seen by every
+later access of the wave and a read comes before every later write; the
+console compiler leaves out barriers inside one wave. Two halves keep that
+order if they meet at a group barrier between any two LDS accesses of
+which one writes (`Lower::lds_meet`). In the console flow every thread of
+the group runs every block, so such a barrier is reached by all of them; it
+is placed before the instruction's own EXEC guard. Reads after a barrier
+share it; at the start of an IR block the first access meets. A program's
+own `s_barrier` counts as a meeting. The group-shared slots of
+`Lower::exchange` are a variable of their own, apart from the title's LDS.
+
+A group of one console wave that uses LDS goes to the console flow on a
+host without 64-lane waves even when it reads no other lane (it declared
+`WaveSize(64)` before, and stopped there).
+
+Left as is: two lanes of the two halves writing the same dword in one
+instruction keep the host's order, not the console's.
+
+### Scalars after a divergent loop
+
+After a loop its lanes leave at different times, the console wave's scalars
+are what the last iteration (of any lane) left. The per-lane form takes
+them from the lane that ran longest, with a wave maximum
+(`Lower::leave_loops`): over a host wave of 32 that is a half, and each
+half had its own count (lanes 0-31 read 32 where the console reads 64).
+Where the console flow can run the program it does so now: its loops run
+while any lane of the console wave does. `valu_tests` checks both cases
+on the host's own wave sizes.
 
 Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-
@@ -169,7 +202,7 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters), then one-wave LDS sharing.
+6. Multi-wave groups (counters), then ~~one-wave LDS sharing~~.
 
 ## Credit
 

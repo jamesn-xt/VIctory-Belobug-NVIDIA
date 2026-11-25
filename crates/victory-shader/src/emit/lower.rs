@@ -528,6 +528,16 @@ struct Lower<'a> {
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
+    /// A wave64 compute program of one console wave per group that the
+    /// console flow can run on this host, which has no 64-lane waves.
+    console_flow_ok: bool,
+    /// The console flow of a split group that shares LDS: its halves meet
+    /// at a barrier between LDS accesses that must see each other
+    /// ([`Self::lds_meet`]).
+    lds_in_step: bool,
+    /// Since the last barrier in IR block `.0`: an LDS access (`.1`), an LDS
+    /// write (`.2`).
+    lds_since: (usize, bool, bool),
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// The console thread's flat id in the group (relabelled; see
@@ -1125,6 +1135,8 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
+        let mut lds_in_step = false;
+        let mut console_flow_ok = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1206,16 +1218,19 @@ impl<'a> Lower<'a> {
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
-                && !split
-                && x.native.wave64
+            // for a group of one console wave. So does a group of one console
+            // wave sharing LDS, whose compiler leaves out the barriers between
+            // its lanes (they run in step): in the console flow every thread
+            // runs every block, so the halves can meet at a barrier between
+            // LDS accesses ([`Lower::lds_meet`]).
+            console_flow_ok = x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            wants_console_flow =
+                ((console_lanes && !split) || (one_wave && s.lds_dwords > 0)) && console_flow_ok;
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -1237,6 +1252,7 @@ impl<'a> Lower<'a> {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
+                lds_in_step = split && s.lds_dwords > 0;
             }
             if split {
                 s.wave_size = Some(32);
@@ -1331,6 +1347,9 @@ impl<'a> Lower<'a> {
             uint_srvs,
             split,
             console_cf: x.console_cf,
+            console_flow_ok,
+            lds_in_step,
+            lds_since: (usize::MAX, true, true),
             wants_console_flow,
             console_flat: None,
             xchg: None,
@@ -2018,6 +2037,23 @@ impl<'a> Lower<'a> {
             }
         }
         self.find_loop_exits();
+        // After a divergent loop a console wave's scalars are what the lane
+        // that ran it longest left ([`Self::leave_loops`]), found by a wave
+        // operation over the host wave: on a host without 64-lane waves half
+        // the console wave, each half with its own result. The console flow
+        // runs the loop while any lane of the console wave does, as the
+        // console does; where it cannot, the per-lane form stays.
+        if self.console_flow_ok
+            && !self.x.console_cf
+            && !self.x.per_lane_only
+            && self
+                .loop_exits
+                .values()
+                .flatten()
+                .any(|(_, after)| !after.is_empty())
+        {
+            return Err(unsupported(0, CONSOLE_FLOW));
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -4988,6 +5024,9 @@ impl<'a> Lower<'a> {
         if fence {
             self.uav_fence();
         }
+        if self.lds_in_step {
+            self.lds_meet(inst, b);
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -5000,6 +5039,7 @@ impl<'a> Lower<'a> {
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.lds_since = (b, false, false);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -12675,6 +12715,47 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.bin(e, Bin::And, f, mask);
         let half = self.s.m.bin(e, Bin::LShr, lane, k5);
         (lane, half)
+    }
+
+    /// [`Self::lds_in_step`]: the console runs a wave's lanes in step, so an
+    /// LDS write is seen by every later access of the wave and a read comes
+    /// before every later write; the console compiler leaves out barriers
+    /// within one wave. Two host waves standing for the console wave keep
+    /// that order if they meet at a barrier between any two LDS accesses of
+    /// which one writes. In the console flow every thread of the group runs
+    /// every block, so the barrier is reached by all of them; it goes before
+    /// the instruction's own lane guard. Reads after a barrier share it; at
+    /// the start of an IR block what came before is not known, so the first
+    /// access meets.
+    /// shortcut: two lanes of the two halves writing one dword in the same
+    /// instruction keep the host's order, not the console's.
+    fn lds_meet(&mut self, inst: &Inst, b: usize) {
+        let name = inst.name();
+        let access = match &inst.fields {
+            Fields::Ds { gds: false, .. } => {
+                !(name.starts_with("ds_swizzle") || name.contains("permute") || name == "ds_nop")
+            }
+            Fields::Buffer { lds: true, .. } => true,
+            _ => false,
+        };
+        if !access {
+            return;
+        }
+        let writes = !name.starts_with("ds_read");
+        if self.lds_since.0 != b {
+            self.lds_since = (b, true, true);
+        }
+        let (_, any, wrote) = self.lds_since;
+        if (writes && any) || wrote {
+            // Thread-group sync with a group-shared memory fence.
+            let mode = self.s.m.i32(1 | 8);
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            self.lds_since = (b, false, false);
+        }
+        self.lds_since.1 = true;
+        self.lds_since.2 |= writes;
     }
 
     /// Console flow: each half gives `x` (the same in all its lanes) and
