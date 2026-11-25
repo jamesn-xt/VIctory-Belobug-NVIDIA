@@ -123,7 +123,22 @@ fn note_crashed(name: &str) {
 }
 
 /// Whether the driver crashed making the pipeline named `name` before.
+/// Whether a fault in the driver's compiler leaves the pipeline out
+/// (`VICTORY_COMPILER_GUARD=0` turns it off, and with it the list of
+/// pipelines left out before). The guard sees a fault first, before the
+/// driver's own handlers: NVIDIA's compiler takes faults of its own near
+/// address 0 on some of the world's mesh pipelines that it handles itself
+/// (an RTX 5080, 2026-11-25: 20-28 pipelines parked a run, refused every
+/// run after, all made by an older build without the guard).
+fn compiler_guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COMPILER_GUARD").map_or(true, |v| v.trim() != "0"))
+}
+
 fn crashed(name: &str) -> bool {
+    if !compiler_guard() {
+        return false;
+    }
     static NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     NAMES
         .get_or_init(|| {
@@ -152,7 +167,11 @@ impl Making {
         static HANDLER: std::sync::Once = std::sync::Once::new();
         // SAFETY: a handler that lives as long as the process.
         HANDLER.call_once(|| unsafe {
-            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+            if compiler_guard() {
+                AddVectoredExceptionHandler(1, Some(compiler_crashed));
+            } else {
+                tracing::warn!("VICTORY_COMPILER_GUARD=0: the driver's compiler's faults are left to the driver");
+            }
         });
         MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
         endless(name, true);
