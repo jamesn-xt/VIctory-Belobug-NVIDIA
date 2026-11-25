@@ -5915,6 +5915,16 @@ impl<'a> Lower<'a> {
                 };
                 (u_bit, stride)
             });
+        // A descriptor loaded from the resource heap by index has no
+        // used-resource entry, and what the title keeps in those slots are
+        // buffer views (shader resource views on the host), not constant
+        // buffer views: a raw buffer. Read as a constant buffer, the access
+        // is outside what D3D12 defines (GPU-based validation: "Descriptor
+        // type doesn't match shader register type", SRV in the heap, CBV
+        // register) and hosts differ in what it gives: the meshlet culling
+        // programs read the scene's buffer this way (heap index 17), and on
+        // a Radeon 8060S they culled nearly everything.
+        let raw = raw.or_else(|| (kind.is_none() && self.heap_indexed(src)).then_some((0, 0)));
         let props = match raw {
             Some((u_bit, 0)) => (11 | u_bit, 0),
             Some((u_bit, stride)) => (12 | u_bit, stride),
@@ -6770,6 +6780,21 @@ impl<'a> Lower<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Whether every load `src` comes from reads the resource heap by index
+    /// (not a table, whose entries have used-resource records).
+    fn heap_indexed(&self, src: &Source) -> bool {
+        let leaves = src.leaves();
+        !leaves.is_empty()
+            && leaves.iter().all(|l| match l {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                    .scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|rp| rp.root == RootType::ResourceHeap),
+                _ => false,
+            })
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
