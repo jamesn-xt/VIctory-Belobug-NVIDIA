@@ -65,6 +65,7 @@ unsafe impl Send for Finish {}
 /// rw1, 2026-11-25): the wait for the host GPU goes from 78-95 to 4-17 ms.
 /// It gained nothing while the title's recording threads took turns on the
 /// views table's mutex.
+#[cfg(not(test))]
 fn async_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0"))
@@ -89,6 +90,8 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     /// Async submissions not yet retired, oldest first.
     in_flight: Mutex<std::collections::VecDeque<InFlight>>,
+    #[cfg(test)]
+    test_release_before_drain: Option<std::sync::mpsc::Sender<()>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -438,6 +441,8 @@ impl Host {
                 fence,
                 submitted: Mutex::new(0),
                 in_flight: Mutex::new(std::collections::VecDeque::new()),
+                #[cfg(test)]
+                test_release_before_drain: None,
                 event,
                 rtvs,
                 rtv_size,
@@ -547,6 +552,9 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         Ok(adapter)
     }
 }
+
+#[cfg(test)]
+mod prewarm_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1291,6 +1299,10 @@ impl Host {
         if keep.is_some() && self.has_in_flight() {
             self.prewarm(runs);
         }
+        #[cfg(test)]
+        if self.has_in_flight() && let Some(release) = &self.test_release_before_drain {
+            release.send(()).expect("test fence receiver");
+        }
         self.drain_in_flight_locked();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
@@ -1382,10 +1394,13 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
-        let can_async = !cfg!(test)
-            && keep.is_some()
+        #[cfg(test)]
+        let allow_async = || self.test_release_before_drain.is_some();
+        #[cfg(not(test))]
+        let allow_async = async_submit;
+        let can_async = keep.is_some()
             && !each
-            && async_submit()
+            && allow_async()
             && card_writes.is_empty();
         if let Some(first) = first {
             // SAFETY: a closed list.

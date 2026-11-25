@@ -280,6 +280,18 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_upload(
+        buffer: ID3D12Resource,
+        mapped: *mut u8,
+        address: u64,
+        len: u64,
+    ) -> Arc<Self> {
+        // SAFETY: a live upload buffer, mapped for its lifetime by the test.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Arc::new(Self::new(buffer, mapped, gpu, address, len, None))
+    }
+
     fn new(
         buffer: ID3D12Resource,
         data: *mut u8,
