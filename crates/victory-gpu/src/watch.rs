@@ -39,18 +39,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// While a span's region epoch stays unchanged, any range already guarded and
 /// copied at that epoch cannot have been modified by the title — and
 /// `copy_back` on one buffer no longer invalidates clean spans in other regions.
-const REGION_SHIFT: usize = 26; // 64 MiB per bucket
-const REGION_BUCKETS: usize = 1024;
+///
+/// A region is one guarded block (64 KiB) now, where it was 64 MiB: the
+/// title writes somewhere in every 64 MiB of its buffers between two checks
+/// of the same range, so nearly every first check of a range walked all its
+/// blocks under the guards' lock (14,000 walks and 12 GB of ranges a world
+/// frame, 96 % of them unchanged). `VICTORY_EPOCH_SHIFT=26` is the old size.
+/// Regions are never smaller than a block: opening a block bumps the regions
+/// of the address written, which must be those of the whole block.
+const REGION_BUCKETS: usize = 1 << 20; // 64 GiB of 64 KiB regions before two share a bucket
 static REGION_EPOCHS: [AtomicU64; REGION_BUCKETS] =
-    [const { AtomicU64::new(1) }; REGION_BUCKETS];
+    [const { AtomicU64::new(0) }; REGION_BUCKETS];
+
+#[inline]
+fn region_shift() -> usize {
+    static SHIFT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SHIFT.get_or_init(|| {
+        std::env::var("VICTORY_EPOCH_SHIFT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(16, |s| s.clamp(16, 30))
+    })
+}
 
 #[inline]
 fn bump_region_epochs(start: usize, end: usize) {
     if start >= end {
         return;
     }
-    let first = start >> REGION_SHIFT;
-    let last = (end - 1) >> REGION_SHIFT;
+    let first = start >> region_shift();
+    let last = (end - 1) >> region_shift();
     let count = last - first + 1;
     if count >= REGION_BUCKETS {
         for slot in &REGION_EPOCHS {
@@ -68,8 +86,8 @@ pub(crate) fn region_epoch(start: usize, end: usize) -> u64 {
     if start >= end {
         return 0;
     }
-    let first = start >> REGION_SHIFT;
-    let last = (end - 1) >> REGION_SHIFT;
+    let first = start >> region_shift();
+    let last = (end - 1) >> region_shift();
     let count = last - first + 1;
     let mut hash = 0u64;
     if count >= REGION_BUCKETS {
@@ -1004,6 +1022,26 @@ mod tests {
         assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![pages(one, 0)]));
         // SAFETY: the same byte through the other view.
         assert_eq!(unsafe { ((two + 16) as *const u8).read() }, 7);
+        drop_views(&[one, two]);
+    }
+
+    /// A write changes the epoch of the ranges that hold its block and of no
+    /// other: the block beside it stays known clean.
+    #[test]
+    fn a_write_changes_the_epoch_of_its_block_alone() {
+        let (one, two) = two_views();
+        assert!(guard(one, one + 2 * BLOCK).is_some());
+        let first = region_epoch(one, one + BLOCK);
+        let second = region_epoch(one + BLOCK, one + 2 * BLOCK);
+        let both = region_epoch(one, one + 2 * BLOCK);
+        // Part of a block is the block's region too.
+        let part = region_epoch(one + BLOCK + 4096, one + BLOCK + 8192);
+        // SAFETY: the view's second block; the handler opens it on the fault.
+        unsafe { ((one + BLOCK + 8) as *mut u8).write(3) };
+        assert_eq!(region_epoch(one, one + BLOCK), first, "the block beside it");
+        assert_ne!(region_epoch(one + BLOCK, one + 2 * BLOCK), second);
+        assert_ne!(region_epoch(one, one + 2 * BLOCK), both);
+        assert_ne!(region_epoch(one + BLOCK + 4096, one + BLOCK + 8192), part);
         drop_views(&[one, two]);
     }
 
