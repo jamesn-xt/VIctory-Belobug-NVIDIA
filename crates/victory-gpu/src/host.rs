@@ -71,10 +71,6 @@ fn async_submit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0"))
 }
 
-/// Microseconds spent bringing buffer copies up to date while the
-/// submission before ran ([`Host::prewarm`]), since the last frame line.
-static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// The newest unwaited submission (its fence value) that is finished:
 /// waited for and its results put back.
 static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1260,30 +1256,11 @@ impl Host {
     /// read-backs and bottom-of-pipe writes done) when it is waited for:
     /// before the next submission's own preparation, a title fence's
     /// signal, a present, or a reset of one of its lists. Meanwhile the
-    /// next submission's buffer copies are brought up to date, so the
-    /// processor and the card work at the same time for that long.
+    /// title can record its next command lists while the card runs. Shared
+    /// upload bytes are refreshed only after the preceding submission ends.
     pub(crate) fn execute_title(&self, runs: &[std::sync::Arc<HostList>]) {
         let lists: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
         self.execute_inner(&lists, Some(runs));
-    }
-
-    /// Brings the buffer copies `runs` will ask for up to date while the
-    /// submission before still runs: the same refreshes as the lists'
-    /// steps make, early. The ranges that submission's shaders write are
-    /// left alone (`Shadow::update` goes around them), and the steps in
-    /// their order do it all again after the wait, finding little left.
-    fn prewarm(&self, runs: &[&HostList]) {
-        let started = std::time::Instant::now();
-        let mut batch = Batch::default();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::Refresh(shadow, address, len) = step {
-                    batch.add(shadow, *address, *len);
-                }
-            }
-        }
-        batch.flush();
-        PREWARM_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
@@ -1294,11 +1271,10 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // Wait for any previous async submission before mutating shared Shadow
         // buffers in `prepare`. During the gap between submissions, the GPU
-        // ran in parallel with the title's CPU command-list recording, and
-        // runs on while this submission's buffer copies are refreshed.
-        if keep.is_some() && self.has_in_flight() {
-            self.prewarm(runs);
-        }
+        // ran in parallel with the title's CPU command-list recording.
+        // Even ranges the GPU only reads must remain unchanged until it
+        // finishes. Early prewarming overwrote shared upload memory still
+        // being consumed by the previous submission (PR #203 regression).
         #[cfg(test)]
         if self.has_in_flight() && let Some(release) = &self.test_release_before_drain {
             release.send(()).expect("test fence receiver");
